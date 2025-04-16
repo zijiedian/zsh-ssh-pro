@@ -1,22 +1,75 @@
 # zsh-ssh
 
-Better host completion for ssh in Zsh.
+Enhanced SSH host management and completion for Zsh with fzf integration.
 
 [![asciicast](https://asciinema.org/a/381405.svg)](https://asciinema.org/a/381405)
 
-- [zsh-ssh](#zsh-ssh)
-    - [Installation](#installation)
-        - [Zinit](#zinit)
-        - [Antigen](#antigen)
-        - [Oh My Zsh](#oh-my-zsh)
-        - [Sheldon](#sheldon)
-        - [Manual (Git Clone)](#manual-git-clone)
-    - [Usage](#usage)
-        - [SSH Config Example](#ssh-config-example)
+## Features
+
+- 🔍 Interactive host selection with fzf
+- 📝 SSH config management (add/modify/remove)
+- 🔐 Secure password storage with base64 encoding
+- 🎯 Smart host completion with descriptions
+- 📋 Detailed host information preview
+- 🔄 Proxy command support
+- 📦 Backup mechanism for config changes
+
+## Dependencies
+
+Before installing zsh-ssh, make sure you have the following tools installed:
+
+### Required Dependencies
+
+#### fzf (Fuzzy Finder)
+```shell
+# macOS
+brew install fzf
+
+# Ubuntu/Debian
+sudo apt-get install fzf
+
+# CentOS/RHEL
+sudo yum install fzf
+
+# Arch Linux
+sudo pacman -S fzf
+```
+
+#### gawk (GNU awk)
+```shell
+# macOS
+brew install gawk
+
+# Ubuntu/Debian
+sudo apt-get install gawk
+
+# CentOS/RHEL
+sudo yum install gawk
+
+# Arch Linux
+sudo pacman -S gawk
+```
+
+### Optional Dependencies
+
+#### sshpass (for password authentication)
+```shell
+# macOS
+brew install sshpass
+
+# Ubuntu/Debian
+sudo apt-get install sshpass
+
+# CentOS/RHEL
+sudo yum install sshpass
+
+# Arch Linux
+sudo pacman -S sshpass
+```
 
 ## Installation
 
-Make sure you have [fzf](https://github.com/junegunn/fzf) installed.
+Make sure you have installed all the required dependencies before proceeding.
 
 ### Zinit
 
@@ -77,21 +130,83 @@ antigen bundle sunlei/zsh-ssh
 
 ## Usage
 
-Just press <kbd>Tab</kbd> after `ssh` command as usual.
+### SSH Host Completion
+
+Press <kbd>Tab</kbd> after `ssh` command to get interactive host selection with fzf.
+
+### SSH Config Management
+
+#### Add New Host
+```shell
+sshadd
+```
+Interactive prompt to add a new SSH host configuration.
+
+#### Modify Existing Host
+```shell
+sshmod [hostname]
+```
+- Without hostname: Interactive selection with fzf
+- With hostname: Directly modify specified host
+
+#### Remove Host
+```shell
+sshrm [hostname]
+```
+- Without hostname: Interactive selection with fzf
+- With hostname: Directly remove specified host
 
 ### SSH Config Example
 
-You can use `#_Desc` to set description.
+You can use `#_Desc` to set description and `#_Password` for encrypted password storage.
 
 ~/.ssh/config
 
 ```text
-Host Bastion-Host
+# Development Server
+Host dev-server
     Hostname 1.1.1.1
-    User sunlei
+    User developer
+    #_Desc Development Environment
+    #_Password <base64-encoded-password>
+    IdentityFile ~/.ssh/dev-key
 
-Host Development-Host
+# Production Server
+Host prod-server
     Hostname 2.2.2.2
-    IdentityFile ~/.ssh/development-host
-    #_Desc For Development
+    User admin
+    #_Desc Production Environment
+    Port 2222
+    ProxyCommand ssh -q -W %h:%p jump@bastion.example.com
 ```
+
+## Features in Detail
+
+### Interactive Host Selection
+- Fuzzy search through all configured hosts
+- Preview host details in real-time
+- Color-coded descriptions
+- Keyboard navigation support
+
+### Secure Password Management
+- Passwords stored in base64 encoding
+- Optional password authentication
+- Secure password input (hidden)
+
+### Proxy Support
+- Jump server configuration
+- Custom proxy commands
+- Proxy user specification
+
+### Backup System
+- Automatic backup before modifications
+- Timestamped backup files
+- Config validation
+
+## Requirements
+
+- zsh
+- fzf (required)
+- gawk (required)
+- base64 (usually pre-installed)
+- sshpass (optional, for password authentication)

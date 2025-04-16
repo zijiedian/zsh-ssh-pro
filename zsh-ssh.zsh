@@ -3,8 +3,21 @@
 setopt no_beep # Don't beep
 
 SSH_CONFIG_FILE="${SSH_CONFIG_FILE:-$HOME/.ssh/config}"
-EXPECT_SCRIPT_DIR="${HOME}/.ssh/expect"
-[[ ! -d "$EXPECT_SCRIPT_DIR" ]] && mkdir -p "$EXPECT_SCRIPT_DIR"
+SSH_BACKUP_DIR="${HOME}/.ssh/backups"
+[[ ! -d "$SSH_BACKUP_DIR" ]] && mkdir -p "$SSH_BACKUP_DIR"
+
+# Function to manage backups
+_manage_backups() {
+  # Keep only the 5 most recent backups
+  ls -t "$SSH_BACKUP_DIR"/*.bak.* 2>/dev/null | tail -n +6 | xargs -r rm
+}
+
+# Function to create backup
+_create_backup() {
+  local backup_file="${SSH_BACKUP_DIR}/config.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$SSH_CONFIG_FILE" "$backup_file"
+  _manage_backups
+}
 
 # Parse the SSH config file
 _parse_config_file() {
@@ -125,19 +138,32 @@ _ssh_host_list() {
 
 _ssh_connect() {
   local host=$1
-  local password_encoded=$(awk -v host="$host" '
+  local proxy_command=$(ssh -T -G "$host" 2>/dev/null | awk '/^proxycommand / { $1=""; print }')
+  
+  if [[ -n "$proxy_command" ]]; then
+    export PROXY_COMMAND="$proxy_command"
+  fi
+  
+  echo $host
+  
+  # Check if host exists
+  if ! grep -q "^Host[[:space:]]\+$host$" "$SSH_CONFIG_FILE"; then
+    echo "Host '$host' not found in config"
+    return 1
+  fi
+
+  # Extract current config using the same logic as _ssh_modify_config
+  local current_config=$(awk -v host="$host" '
     BEGIN { in_block = 0 }
-    $0 ~ "^Host[[:space:]]+" host "$" { in_block = 1; next }
-    in_block && /^[[:space:]]*#_Password[[:space:]]+/ { 
-      sub(/^[[:space:]]*#_Password[[:space:]]*/, "", $0)
-      print $0
-      exit
-    }
-    in_block && /^Host / { exit }
+    $0 ~ "^Host[[:space:]]+" host "$" { in_block = 1; print; next }
+    in_block && /^Host / { in_block = 0 }
+    in_block { print }
   ' "$SSH_CONFIG_FILE")
+
+  # Get password using the same logic as _ssh_modify_config
+  local password_encoded=$(echo "$current_config" | awk '/^[[:space:]]*#_Password/ { print $2 }')
   
   if [[ -n "$password_encoded" ]]; then
-    local password=$(echo "$password_encoded" | base64 -d)
     # Check if sshpass is installed
     if ! command -v sshpass &> /dev/null; then
       echo "sshpass is not installed. Please install it first:"
@@ -147,10 +173,11 @@ _ssh_connect() {
       return 1
     fi
     
-    # Use sshpass to connect
-    sshpass -p "$password" ssh "$host"
+    # Use sshpass to connect with -t parameter in a new zsh context
+    zsh -c "sshpass -p '$(echo "$password_encoded" | base64 -d)' ssh -t '$host'"
   else
-    ssh "$host"
+    # Use -t parameter for standard SSH connection in a new zsh context
+    zsh -c "ssh -t '$host'"
   fi
 }
 
@@ -258,9 +285,10 @@ _set_lbuffer() {
   fi
 
   selected_host=$(cut -f 1 -d " " <<< ${result})
-  connect_cmd="ssh ${selected_host}"
-
-  LBUFFER="$connect_cmd"
+  
+  # Execute the command in the background to avoid zle context issues
+  (_ssh_connect "$selected_host" &)
+  LBUFFER=""
 }
 
 fzf_complete_ssh() {
@@ -283,8 +311,7 @@ fzf_complete_ssh() {
 
     if [ $(echo $result | wc -l) -eq 1 ]; then
       _set_lbuffer $result false
-      zle reset-prompt
-      # zle redisplay
+      zle -I
       return
     fi
 
@@ -306,11 +333,8 @@ fzf_complete_ssh() {
 
     if [ -n "$result" ]; then
       _set_lbuffer $result true
-      zle accept-line
+      zle -I
     fi
-
-    zle reset-prompt
-    # zle redisplay
 
   # Fall back to default completion
   else
@@ -362,7 +386,7 @@ _ssh_remove_config() {
   fi
 
   # Create a backup before modification
-  cp "$SSH_CONFIG_FILE" "${SSH_CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  _create_backup
 
   # Remove the host block from config
   awk -v host="$host" '
@@ -418,7 +442,7 @@ _ssh_modify_config() {
   fi
 
   # Create a backup before modification
-  cp "$SSH_CONFIG_FILE" "${SSH_CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  _create_backup
 
   # Extract current config
   local current_config=$(awk -v host="$host" '

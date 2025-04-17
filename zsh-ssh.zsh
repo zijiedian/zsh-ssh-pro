@@ -46,6 +46,16 @@ _parse_config_file() {
 }
 
 _ssh_host_list() {
+  if [[ ! -f "$SSH_CONFIG_FILE" ]]; then
+    echo "SSH config file not found: $SSH_CONFIG_FILE" >&2
+    return 1
+  fi
+
+  if [[ ! -r "$SSH_CONFIG_FILE" ]]; then
+    echo "Cannot read SSH config file: $SSH_CONFIG_FILE" >&2
+    return 1
+  fi
+
   local ssh_config host_list
 
   ssh_config=$(_parse_config_file $SSH_CONFIG_FILE)
@@ -137,47 +147,96 @@ _ssh_host_list() {
 }
 
 _ssh_connect() {
-  local host=$1
-  local proxy_command=$(ssh -T -G "$host" 2>/dev/null | awk '/^proxycommand / { $1=""; print }')
-  
-  if [[ -n "$proxy_command" ]]; then
-    export PROXY_COMMAND="$proxy_command"
-  fi
-  
-  echo $host
-  
-  # Check if host exists
-  if ! grep -q "^Host[[:space:]]\+$host$" "$SSH_CONFIG_FILE"; then
-    echo "Host '$host' not found in config"
+  local host="$1"
+  shift
+  local args=("$@")
+  local auto_add=false
+  local hostname user port
+
+  # 如果没有提供主机名，直接返回
+  if [[ -z "$host" ]]; then
+    echo "No host specified"
     return 1
   fi
 
-  # Extract current config using the same logic as _ssh_modify_config
-  local current_config=$(awk -v host="$host" '
-    BEGIN { in_block = 0 }
-    $0 ~ "^Host[[:space:]]+" host "$" { in_block = 1; print; next }
-    in_block && /^Host / { in_block = 0 }
-    in_block { print }
-  ' "$SSH_CONFIG_FILE")
+  # 检查是否为完整的 SSH 连接字符串 (user@host 或 user@host:port)
+  if [[ "$host" =~ ^([^@]+)@([^:]+)(:([0-9]+))?$ ]]; then
+    user="${match[1]}"
+    hostname="${match[2]}"
+    port="${match[4]:-22}"
+    auto_add=true
+  elif [[ "$host" =~ ^([^:]+)(:([0-9]+))?$ && ! "$host" =~ ^- ]]; then
+    hostname="${match[1]}"
+    port="${match[3]:-22}"
+    user="$USER"
+    auto_add=true
+  fi
 
-  # Get password using the same logic as _ssh_modify_config
-  local password_encoded=$(echo "$current_config" | awk '/^[[:space:]]*#_Password/ { print $2 }')
-  
+  # 首先尝试使用 ssh -G 检查配置是否存在
+  if ! ssh -G "$host" &>/dev/null; then
+    if [[ "$auto_add" = true ]]; then
+      echo "Host '$host' not found in config. Adding automatically..."
+      
+      # 构建新的配置条目
+      local config_entry="\n# Added automatically on $(date '+%Y-%m-%d %H:%M:%S')"
+      config_entry+="\nHost $hostname"
+      config_entry+="\n    HostName $hostname"
+      config_entry+="\n    User $user"
+      config_entry+="\n    Port $port"
+      
+      # 检查配置文件是否存在
+      if [[ ! -f "$SSH_CONFIG_FILE" ]]; then
+        mkdir -p "$(dirname "$SSH_CONFIG_FILE")"
+        touch "$SSH_CONFIG_FILE"
+        chmod 600 "$SSH_CONFIG_FILE"
+      fi
+      
+      # 添加新配置
+      echo -e "$config_entry" >> "$SSH_CONFIG_FILE"
+      echo "Added new SSH config for $hostname"
+      
+      # 更新 host 为新添加的配置名
+      host="$hostname"
+    fi
+  fi
+
+  # 尝试从配置文件获取密码配置
+  local current_config password_encoded
+  if [[ -f "$SSH_CONFIG_FILE" ]]; then
+    current_config=$(awk -v host="$host" '
+      BEGIN { in_block = 0 }
+      $0 ~ "^Host[[:space:]]+" host "$" { in_block = 1; print; next }
+      in_block && /^Host / { in_block = 0 }
+      in_block { print }
+    ' "$SSH_CONFIG_FILE")
+    
+    password_encoded=$(echo "$current_config" | awk '/^[[:space:]]*#_Password/ { print $2 }')
+  fi
+
+  # 执行 SSH 连接
   if [[ -n "$password_encoded" ]]; then
-    # Check if sshpass is installed
-    if ! command -v sshpass &> /dev/null; then
-      echo "sshpass is not installed. Please install it first:"
-      echo "  - On macOS: brew install sshpass"
-      echo "  - On Ubuntu/Debian: sudo apt-get install sshpass"
-      echo "  - On CentOS/RHEL: sudo yum install sshpass"
+    if ! command -v sshpass &>/dev/null; then
+      echo "sshpass is required for password authentication" >&2
       return 1
     fi
     
-    # Use sshpass to connect with -t parameter in a new zsh context
-    zsh -c "sshpass -p '$(echo "$password_encoded" | base64 -d)' ssh -t '$host'"
+    local decoded_password
+    if ! decoded_password=$(echo "$password_encoded" | base64 -d 2>/dev/null); then
+      echo "Failed to decode password" >&2
+      return 1
+    fi
+    
+    if [[ ${#args[@]} -eq 0 ]]; then
+      SSHPASS="$decoded_password" sshpass -e ssh -t "$host"
+    else
+      SSHPASS="$decoded_password" sshpass -e ssh -t "$host" "${args[@]}"
+    fi
   else
-    # Use -t parameter for standard SSH connection in a new zsh context
-    zsh -c "ssh -t '$host'"
+    if [[ ${#args[@]} -eq 0 ]]; then
+      ssh -t "$host"
+    else
+      ssh -t "$host" "${args[@]}"
+    fi
   fi
 }
 
@@ -255,108 +314,6 @@ _add_ssh_config() {
     chmod 600 "$SSH_CONFIG_FILE"
   fi
 }
-
-_fzf_list_generator() {
-  local header host_list
-
-  if [ -n "$1" ]; then
-    host_list="$1"
-  else
-    host_list=$(_ssh_host_list)
-  fi
-
-  header="
-Alias|->|Hostname|User|Desc
-─────|──|────────|────|────
-"
-
-  host_list="${header}\n${host_list}"
-
-  echo $host_list | command column -t -s '|'
-}
-
-_set_lbuffer() {
-  local result selected_host connect_cmd is_fzf_result
-  result="$1"
-  is_fzf_result="$2"
-
-  if [ "$is_fzf_result" = false ] ; then
-    result=$(cut -f 1 -d "|" <<< ${result})
-  fi
-
-  selected_host=$(cut -f 1 -d " " <<< ${result})
-  
-  # Execute the command in the background to avoid zle context issues
-  (_ssh_connect "$selected_host" &)
-  LBUFFER=""
-}
-
-fzf_complete_ssh() {
-  local tokens cmd result selected_host
-  setopt localoptions noshwordsplit noksh_arrays noposixbuiltins
-
-  tokens=(${(z)LBUFFER})
-  cmd=${tokens[1]}
-
-  if [[ "$LBUFFER" =~ "^ *ssh$" ]]; then
-    zle ${fzf_ssh_default_completion:-expand-or-complete}
-  elif [[ "$cmd" == "ssh" ]]; then
-    result=$(_ssh_host_list ${tokens[2, -1]})
-    fuzzy_input="${LBUFFER#"$tokens[1] "}"
-
-    if [ -z "$result" ]; then
-      zle ${fzf_ssh_default_completion:-expand-or-complete}
-      return
-    fi
-
-    if [ $(echo $result | wc -l) -eq 1 ]; then
-      _set_lbuffer $result false
-      zle -I
-      return
-    fi
-
-    result=$(_fzf_list_generator $result | fzf \
-      --height 40% \
-      --ansi \
-      --border \
-      --cycle \
-      --info=inline \
-      --header-lines=2 \
-      --reverse \
-      --prompt='SSH Remote > ' \
-      --query=$fuzzy_input \
-      --no-separator \
-      --bind 'shift-tab:up,tab:down,bspace:backward-delete-char/eof' \
-      --preview 'ssh -T -G $(cut -f 1 -d " " <<< {}) | grep -i -E "^User |^HostName |^Port |^ControlMaster |^ForwardAgent |^LocalForward |^IdentityFile |^RemoteForward |^ProxyCommand |^ProxyJump " | column -t' \
-      --preview-window=right:40%
-    )
-
-    if [ -n "$result" ]; then
-      _set_lbuffer $result true
-      zle -I
-    fi
-
-  # Fall back to default completion
-  else
-    zle ${fzf_ssh_default_completion:-expand-or-complete}
-  fi
-}
-
-
-[ -z "$fzf_ssh_default_completion" ] && {
-  binding=$(bindkey '^I')
-  [[ $binding =~ 'undefined-key' ]] || fzf_ssh_default_completion=$binding[(s: :w)2]
-  unset binding
-}
-
-
-zle -N fzf_complete_ssh
-bindkey '^I' fzf_complete_ssh
-
-# Set up aliases for SSH config management
-alias sshadd='_add_ssh_config'
-alias sshrm='_ssh_remove_config'
-alias sshmod='_ssh_modify_config'
 
 # Remove SSH config entry
 _ssh_remove_config() {
@@ -532,4 +489,111 @@ _ssh_modify_config() {
   echo -e "$config_entry" >> "$SSH_CONFIG_FILE"
   printf "${prompt_color}SSH config modified successfully!${reset_color}\n"
 }
+
+
+_fzf_list_generator() {
+  local header host_list
+
+  if [ -n "$1" ]; then
+    host_list="$1"
+  else
+    host_list=$(_ssh_host_list)
+  fi
+
+  header="
+Alias|->|Hostname|User|Desc
+─────|──|────────|────|────
+"
+
+  host_list="${header}\n${host_list}"
+
+  echo $host_list | command column -t -s '|'
+}
+
+_set_lbuffer() {
+  local result selected_host connect_cmd is_fzf_result
+  result="$1"
+  is_fzf_result="$2"
+
+  if [ "$is_fzf_result" = false ] ; then
+    result=$(cut -f 1 -d "|" <<< ${result})
+  fi
+
+  selected_host=$(cut -f 1 -d " " <<< ${result})
+  connect_cmd="ssh ${selected_host}"
+
+  LBUFFER="$connect_cmd"
+}
+
+fzf_complete_ssh() {
+  local tokens cmd result selected_host
+  setopt localoptions noshwordsplit noksh_arrays noposixbuiltins
+
+  tokens=(${(z)LBUFFER})
+  cmd=${tokens[1]}
+
+  if [[ "$LBUFFER" =~ "^ *ssh$" ]]; then
+    zle ${fzf_ssh_default_completion:-expand-or-complete}
+  elif [[ "$cmd" == "ssh" ]]; then
+    result=$(_ssh_host_list ${tokens[2, -1]})
+    fuzzy_input="${LBUFFER#"$tokens[1] "}"
+
+    if [ -z "$result" ]; then
+      zle ${fzf_ssh_default_completion:-expand-or-complete}
+      return
+    fi
+
+    if [ $(echo $result | wc -l) -eq 1 ]; then
+      _set_lbuffer $result false
+      zle reset-prompt
+      # zle redisplay
+      return
+    fi
+
+    result=$(_fzf_list_generator $result | fzf \
+      --height 40% \
+      --ansi \
+      --border \
+      --cycle \
+      --info=inline \
+      --header-lines=2 \
+      --reverse \
+      --prompt='SSH Remote > ' \
+      --query=$fuzzy_input \
+      --no-separator \
+      --bind 'shift-tab:up,tab:down,bspace:backward-delete-char/eof' \
+      --preview 'ssh -T -G $(cut -f 1 -d " " <<< {}) | grep -i -E "^User |^HostName |^Port |^ControlMaster |^ForwardAgent |^LocalForward |^IdentityFile |^RemoteForward |^ProxyCommand |^ProxyJump " | column -t' \
+      --preview-window=right:40%
+    )
+
+    if [ -n "$result" ]; then
+      _set_lbuffer $result true
+      zle accept-line
+    fi
+
+    zle reset-prompt
+    # zle redisplay
+
+  # Fall back to default completion
+  else
+    zle ${fzf_ssh_default_completion:-expand-or-complete}
+  fi
+}
+
+
+[ -z "$fzf_ssh_default_completion" ] && {
+  binding=$(bindkey '^I')
+  [[ $binding =~ 'undefined-key' ]] || fzf_ssh_default_completion=$binding[(s: :w)2]
+  unset binding
+}
+
+
+zle -N fzf_complete_ssh
+bindkey '^I' fzf_complete_ssh
+
+# Set up aliases for SSH config management
+alias sshadd='_add_ssh_config'
+alias sshrm='_ssh_remove_config'
+alias sshmod='_ssh_modify_config'
+alias ssh='_ssh_connect'
 
